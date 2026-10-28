@@ -5,17 +5,17 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { resolveMode } from './mode';
 import { compareDirectories } from './diff';
-import { generateHtmlReport, generateMarkdownSummary, approvalOutcomeBody, ReportMeta } from './report';
+import { writeHtmlReport, generateMarkdownSummary, approvalOutcomeBody, ReportMeta } from './report';
 import { upsertStickyComment, upsertMarkedComment, listPrComments, STATUS_MARKER } from './comment';
-import { parseApprovalCommands, applyApprovals, isApproveComment, checkboxPin } from './approvals';
-import { findVrtRunsToRerun, rerunFailedJobs, reactToComment, approvalReceivedBody } from './approve';
+import { parseApprovalCommands, applyApprovals, isApproveComment, boxTick, approvalsUnreadableMessage } from './approvals';
+import { findVrtRunsToRerun, rerunFailedJobs, reactToComment, approvalReceivedBody, approvalProgressBody } from './approve';
 import {
   baselineArtifactName,
   reportArtifactName,
   findBaselineArtifact,
   downloadBaselineArtifact,
   uploadDirectoryAsArtifact,
-  uploadFileAsArtifact,
+  uploadFileUnzipped,
 } from './baseline';
 import { CompareSummary } from './types';
 
@@ -95,6 +95,7 @@ async function run(): Promise<void> {
   const prNumber = ctx.payload.pull_request?.number;
   const headSha = ctx.payload.pull_request?.head?.sha ?? ctx.sha;
   let approved = 0;
+  let approvalsReadError: string | undefined;
   if (prNumber && summary.hasChanges) {
     try {
       const comments = await listPrComments(octokit, owner, repo, prNumber);
@@ -111,9 +112,10 @@ async function run(): Promise<void> {
         }
       }
       approved = applyApprovals(summary, approvals, headSha, headCommittedAt);
-      if (approved > 0) core.info(`${approved} visual change(s) approved via /vrt approve comments.`);
+      if (approved > 0) core.info(`${approved} visual change(s) approved via PR checkboxes or /vrt approve comments.`);
     } catch (err) {
-      core.warning(`Could not read PR comments for approvals: ${err instanceof Error ? err.message : String(err)}`);
+      approvalsReadError = err instanceof Error ? err.message : String(err);
+      core.warning(`Could not read PR comments for approvals: ${approvalsReadError}`);
     }
   }
 
@@ -125,13 +127,15 @@ async function run(): Promise<void> {
     missingBaseline: !ref,
     reportArtifactName: reportArtifactName(key),
     prUrl: prNumber ? `https://github.com/${owner}/${repo}/pull/${prNumber}` : undefined,
+    threshold,
   };
 
   let reportPath = '';
   try {
     const reportDir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'vrt-report-'));
-    reportPath = path.join(reportDir, 'index.html');
-    fs.writeFileSync(reportPath, generateHtmlReport(summary, meta));
+    reportPath = path.join(reportDir, reportArtifactName(key));
+    const bytes = writeHtmlReport(reportPath, summary, meta);
+    core.info(`Report: ${(bytes / 1048576).toFixed(1)} MB`);
   } catch (err) {
     core.warning(`Could not generate HTML report: ${err instanceof Error ? err.message : String(err)}`);
     reportPath = '';
@@ -139,9 +143,9 @@ async function run(): Promise<void> {
 
   if (reportPath) {
     try {
-      const artifactId = await uploadFileAsArtifact(reportArtifactName(key), reportPath, retentionDays);
+      const artifactId = await uploadFileUnzipped(reportPath, retentionDays);
       if (artifactId) {
-        meta.reportDownloadUrl = `${meta.runUrl}/artifacts/${artifactId}`;
+        meta.reportUrl = `${meta.runUrl}/artifacts/${artifactId}`;
       }
     } catch (err) {
       core.warning(`Could not upload report artifact: ${err instanceof Error ? err.message : String(err)}`);
@@ -176,7 +180,9 @@ async function run(): Promise<void> {
   );
 
   const unapproved = summary.changed + summary.removed - approved;
-  if (failOnDiff && unapproved > 0) {
+  if (failOnDiff && unapproved > 0 && approvalsReadError !== undefined) {
+    core.setFailed(approvalsUnreadableMessage(approvalsReadError, unapproved));
+  } else if (failOnDiff && unapproved > 0) {
     const missing = summary.results
       .filter((r) => (r.status === 'changed' || r.status === 'removed') && !r.approved)
       .map((r) => r.name);
@@ -184,8 +190,8 @@ async function run(): Promise<void> {
     core.setFailed(
       `Visual changes detected: ${summary.changed} changed, ${summary.removed} removed (${approved} approved).` +
         missingNote +
-        ` Download the "${reportArtifactName(key)}" artifact to review. To accept intentional changes, post a ` +
-        `"/vrt approve" command (see the PR comment) covering every changed and removed screenshot. Merging updates the baselines.`
+        ` Open the "${reportArtifactName(key)}" artifact to review. To accept intentional changes, post a ` +
+        `"/vrt approve" command or tick the boxes in the PR comment, covering every changed and removed screenshot. Merging updates the baselines.`
     );
   } else if (failOnDiff && summary.hasChanges) {
     core.info('All visual changes are approved — passing.');
@@ -209,10 +215,11 @@ async function runApproveMode(token: string, owner: string, repo: string): Promi
   }
 
   const octokit = github.getOctokit(token);
+  const tick = boxTick(commentBody);
   const isBoxTick =
     ctx.payload.action === 'edited' &&
     ctx.payload.comment?.user?.login === 'github-actions[bot]' &&
-    checkboxPin(commentBody) !== null;
+    tick.kind !== 'none';
   const senderLogin: string = ctx.payload.sender?.login ?? '';
 
   if (isBoxTick) {
@@ -246,6 +253,12 @@ async function runApproveMode(token: string, owner: string, repo: string): Promi
       return;
     }
   }
+  if (isBoxTick && tick.kind === 'partial') {
+    // A rerun can only pass once every box is ticked; until then, acknowledge progress.
+    core.info(`${tick.ticked} of ${tick.total} approval boxes ticked — waiting for the rest before rerunning.`);
+    await upsertMarkedComment(octokit, owner, repo, prNumber, STATUS_MARKER, approvalProgressBody(senderLogin, tick.ticked, tick.total));
+    return;
+  }
   const { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const runs = await findVrtRunsToRerun(octokit, owner, repo, pr.head.sha);
   const runUrls: string[] = [];
@@ -257,7 +270,7 @@ async function runApproveMode(token: string, owner: string, repo: string): Promi
   if (runs.length === 0) core.info('No failed visual-regression runs found for the PR head — nothing to rerun.');
   if (commentId) await reactToComment(octokit, owner, repo, commentId);
   const user: string = isBoxTick ? senderLogin : (ctx.payload.comment?.user?.login ?? 'someone');
-  const requested = isBoxTick ? `/vrt approve all@${checkboxPin(commentBody)}` : commentBody;
+  const requested = isBoxTick && tick.kind === 'complete' ? tick.command : commentBody;
   await upsertMarkedComment(octokit, owner, repo, prNumber, STATUS_MARKER, approvalReceivedBody(user, requested, runUrls));
 }
 
